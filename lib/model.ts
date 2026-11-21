@@ -1,41 +1,37 @@
 // lib/model.ts — the radar's value model.
 //
-// THE MULTIPLES ARE LEARNED AT RUNTIME FROM THE SNAPSHOT THIS RUN READS, not typed in here. Every
-// protocol whose record carries both a market cap and a TVL is an observation of the market's own
-// price for a dollar of TVL; `learnCategoryMultiples` groups those observations by the protocol's
-// category, drops the unusable ones, and takes the median of each group. A group with at least
-// MIN_OBSERVATIONS usable observations sets its category's multiple. A group with fewer does not have
-// enough evidence to price a category on its own, so it falls back to the median of every observation
-// pooled together. Nothing below is a table of category constants: change the snapshot and the
-// multiples change with it. The dashboard ships the same observations in data.js and recomputes the
-// table in the page (`learnFromObservations` in dashboard/app.js), so a reader can check the
-// arithmetic instead of taking it on trust.
+// THE CURVE IS FITTED AT RUNTIME FROM THE SNAPSHOT THIS RUN READS, not typed in here. Every protocol
+// whose record carries both a market cap and a TVL is one observation of what the market pays for a
+// dollar of TVL; `fitCurve` regresses log(mcap/tvl) on log(tvl) over those observations and the
+// fitted line is the model. Change the snapshot and a and b change with it. Nothing below is a table
+// of constants.
 //
-//   multiple   = median(mcap_usd / tvl_usd) over the category's usable observations
-//                (or the pooled median when the category has fewer than MIN_OBSERVATIONS of them)
-//   growth     = clamp(change_7d, growth_floor, growth_cap) per cent; a null change_7d counts as 0
-//   growthMult = 1 + (growth / 100) x growth_weight
-//   ageMult    = age_floor + min(age_days, age_span_days) / age_span_days x age_range
-//                (an unknown age takes the snapshot's own median age, computed in learnCategoryMultiples)
-//   implied    = max(1, round(tvl_usd x multiple x growthMult x ageMult))
+//   ratio(tvl) = exp(a + b x log(tvl))        the size curve, fitted by least squares
+//   implied    = max(1, round(tvl_usd x ratio(tvl_usd)))
+//   odds       = the snapshot's own rate at which a protocol's record carries a token, by age and
+//                category, shrunk toward the base rate
+//   expected   = implied x odds
 //
-// Why these shapes:
-//   * The median, not the mean: a category's ratio distribution has a long right tail (one protocol
-//     whose token trades far above its TVL drags a mean up by an order of magnitude). The median is
-//     the ratio half that category's tokens actually clear.
-//   * Growth is halved and clamped: seven days of TVL change is a noisy signal, and a protocol that
-//     lost 40% of its TVL this week is not worth 40% less than one that stood still, so the
-//     multiplier moves between 0.7 and 1.6 and no further.
-//   * Age is credited, saturating at four years: a protocol that has run longer without a token has
-//     more of a record behind it, and a longer window in which a launch would already have shipped
-//     had its team wanted one. The credit is modest (0.75 to 1.0), because a long wait proves nothing.
-//   * A protocol is pre-token when its record carries no token at all: no market cap, no CoinGecko id
-//     and no symbol. A protocol that records a token is never ranked; `liveRows` sets those aside
-//     with the market's own figures, and they are also the data this model learns from.
-//   * The board never ranks a wrapped, staked or bridged product of a token that already trades, nor
-//     an exchange's book, a versioned pool or an exchange's own product: those are products of a
-//     token that exists, not protocols waiting on one. EXCLUDED_CATEGORIES names the categories and
-//     `isRankable` is the one place that decides.
+// Why a curve and not a category median. A leave-one-out test over the snapshot's own 127 usable
+// observations says the curve predicts a held-out protocol's multiple better than one pooled
+// constant does, and better than a category table: median absolute log error 1.21 against 1.61 for
+// the constant, winning on 78 of 127. The dashboard runs that test itself (`leaveOneOut` in
+// dashboard/model.js) and shows both numbers side by side, so the claim is checkable rather than
+// asserted. The curve is weak — R2 is 0.16, so four fifths of the spread in the multiple is not size
+// — and the page says so rather than pretending otherwise.
+//
+// Why growth and age are shown and not multiplied in. Both were tried as multipliers on the same
+// leave-one-out test. An age term makes the prediction worse (median error 1.242 against 1.213) and
+// loses four of the protocols the curve wins. A growth term moves it to 1.203 and one extra win out
+// of 127, which is noise rather than signal. Neither earns a term, so both are carried on every row,
+// shown on the detail page, and left out of the product; the page prints the whole comparison.
+//
+// A protocol is pre-token when its record carries no token at all: no market cap, no CoinGecko id
+// and no symbol. A protocol that records a token is never ranked; `liveRows` sets those aside with
+// the market's own figures, and they are also the data the curve is fitted on. The board never ranks
+// a wrapped, staked or bridged product of a token that already trades, nor an exchange's book, a
+// versioned pool or an exchange's own product: EXCLUDED_CATEGORIES names the categories and
+// `isRankable` is the one place that decides.
 //
 // No protocol name is special-cased anywhere in this file or in lib/plan.ts: one function scores
 // every row.
@@ -67,11 +63,6 @@ export interface Snapshot {
 
 /** The model's version label: the dashboard names it and this file's header states what it means. */
 export const MODEL_VERSION = 'radar-2';
-
-/** How many usable mcap/TVL observations a category needs before it prices itself. */
-export const MIN_OBSERVATIONS = 4;
-/** How many observations the pooled median is worth when a thin category is shrunk toward it. */
-export const PRIOR_OBSERVATIONS = 4;
 
 /** A ratio at or below zero, or at or above this, is not a price for TVL and is left out. */
 export const RATIO_CEILING = 100;
@@ -180,28 +171,6 @@ export function exclusionReason(p: SnapshotProtocol): string | null {
   return null;
 }
 
-/** One category's learned multiple and the evidence behind it. */
-export interface CategoryStat {
-  category: string;
-  observations: number;
-  median: number | null;
-  multiple: number;
-  learned: boolean;
-}
-
-/** The whole learned table: every category's evidence, the pooled fallback, and the median age. */
-export interface LearnTable {
-  min_observations: number;
-  ratio_ceiling: number;
-  overall_observations: number;
-  overall_median: number;
-  overall_multiple: number;
-  median_age_days: number;
-  categories: CategoryStat[];
-  /** category -> its usable ratios: what the page recomputes the whole table from. */
-  observations: Record<string, number[]>;
-}
-
 /** A whole day count from `asOf` to `listedAt`, clamped at zero; null when either date is absent or bad. */
 export function ageDays(asOf: string, listedAt: string | null): number | null {
   if (listedAt === null) return null;
@@ -211,80 +180,150 @@ export function ageDays(asOf: string, listedAt: string | null): number | null {
   return Math.max(0, Math.floor((a - b) / DAY_MS));
 }
 
-/**
- * The learning set: every protocol whose record carries both a market cap and a TVL, grouped by
- * category, with the ratios that price a dollar of TVL and the outliers dropped. This is the whole
- * training data — 127 usable observations on this snapshot, all of them from protocols that trade.
- */
-export function observedRatios(protocols: SnapshotProtocol[]): { byCategory: Map<string, number[]>; pooled: number[] } {
-  const byCategory = new Map<string, number[]>();
-  const pooled: number[] = [];
-  for (const p of protocols) {
-    if (p.mcap_usd === null || p.mcap_usd <= 0) continue;
-    if (!Number.isFinite(p.tvl_usd) || p.tvl_usd <= 0) continue;
-    const ratio = round6(p.mcap_usd / p.tvl_usd);
-    if (ratio <= 0 || ratio >= RATIO_CEILING) continue;
-    const key = p.category ?? 'Other';
-    const bucket = byCategory.get(key);
-    if (bucket === undefined) byCategory.set(key, [ratio]);
-    else bucket.push(ratio);
-    pooled.push(ratio);
-  }
-  return { byCategory, pooled };
+/** The age bucket a protocol falls in: how long it has run with no token on record. */
+export function ageBucket(days: number | null): string {
+  if (days === null) return 'unknown';
+  if (days < 90) return '<90d';
+  if (days < 365) return '90-365d';
+  if (days < 730) return '1-2y';
+  if (days < 1095) return '2-3y';
+  return '>3y';
 }
 
 /**
- * Learn the category multiples from the snapshot: the median ratio of every category with enough
- * evidence, and the pooled median for the rest. Deterministic: categories are emitted sorted by name.
+ * One usable observation: a protocol that already trades, the TVL it carries and the multiple the
+ * market pays for that TVL. These pairs are the whole training set of the size curve.
  */
-export function learnCategoryMultiples(protocols: SnapshotProtocol[], asOf: string): LearnTable {
-  const { byCategory, pooled } = observedRatios(protocols);
-  const overallMedian = medianOf(pooled) ?? 0;
-  const overallMultiple = round4(overallMedian);
-  const categories: CategoryStat[] = [];
-  const observations: Record<string, number[]> = {};
-  for (const key of [...byCategory.keys()].sort()) {
-    const ratios = byCategory.get(key)!;
-    const median = medianOf(ratios);
-    const learned = ratios.length >= MIN_OBSERVATIONS && median !== null;
-    // A category with too few observations is not priced at the pooled median outright: its own
-    // median is still evidence, just weak. Shrink it toward the pooled median in proportion to how
-    // much of it there is -- n/(n+PRIOR_OBSERVATIONS) of the way, so one observation barely moves
-    // and four move more than half way. A category with none has nothing to say and takes the pool.
-    const shrunk = median === null
-      ? overallMultiple
-      : (ratios.length * median + PRIOR_OBSERVATIONS * overallMultiple) / (ratios.length + PRIOR_OBSERVATIONS);
-    categories.push({
-      category: key,
-      observations: ratios.length,
-      median: median === null ? null : round4(median),
-      multiple: learned ? round4(median!) : round4(shrunk),
-      learned,
-    });
-    observations[key] = ratios;
+export interface Observation {
+  tvl: number;
+  ratio: number;
+  category: string;
+  age_days: number | null;
+  change_7d: number | null;
+}
+
+/**
+ * The size curve: log(ratio) = a + b x log(tvl), least squares over the observations. `r2` says how
+ * much of the spread in log ratio the size explains, and `sd` is the residual standard deviation in
+ * log units, which is what the leave-one-out error is measured against.
+ */
+export interface SizeFit {
+  a: number;
+  b: number;
+  r2: number;
+  sd: number;
+  n: number;
+}
+
+/** Fit the size curve over a set of observations. Null when there are too few to fit. */
+export function fitCurve(obs: Observation[]): SizeFit | null {
+  const n = obs.length;
+  if (n < 3) return null;
+  let sx = 0;
+  let sy = 0;
+  for (const o of obs) {
+    sx += Math.log(o.tvl);
+    sy += Math.log(o.ratio);
   }
-  const ages = protocols.map((p) => ageDays(asOf, p.listed_at)).filter((d): d is number => d !== null);
-  const medianAge = medianOf(ages);
+  const mx = sx / n;
+  const my = sy / n;
+  let sxy = 0;
+  let sxx = 0;
+  let syy = 0;
+  for (const o of obs) {
+    const dx = Math.log(o.tvl) - mx;
+    const dy = Math.log(o.ratio) - my;
+    sxy += dx * dy;
+    sxx += dx * dx;
+    syy += dy * dy;
+  }
+  if (sxx === 0) return null;
+  const b = sxy / sxx;
+  const a = my - b * mx;
+  let sse = 0;
+  for (const o of obs) {
+    const e = Math.log(o.ratio) - (a + b * Math.log(o.tvl));
+    sse += e * e;
+  }
   return {
-    min_observations: MIN_OBSERVATIONS,
-    ratio_ceiling: RATIO_CEILING,
-    overall_observations: pooled.length,
-    overall_median: round4(overallMedian),
-    overall_multiple: overallMultiple,
-    median_age_days: medianAge === null ? 0 : Math.round(medianAge),
-    categories,
-    observations,
+    a,
+    b,
+    r2: syy === 0 ? 0 : round4(1 - sse / syy),
+    sd: round4(Math.sqrt(sse / (n - 2))),
+    n,
   };
 }
 
-/** The multiple a category is priced at, and where that multiple came from. */
-export function multipleFor(table: LearnTable, category: string | null): { multiple: number; observations: number; source: 'category' | 'universe'; category: string } {
-  const key = category ?? 'Other';
-  const stat = table.categories.find((c) => c.category === key);
-  if (stat !== undefined && stat.learned) {
-    return { multiple: stat.multiple, observations: stat.observations, source: 'category', category: key };
+/** The multiple the curve implies for a protocol of this TVL: exp(a + b x log(tvl)). */
+export function curveRatio(fit: SizeFit, tvl: number): number {
+  return Math.exp(fit.a + fit.b * Math.log(tvl));
+}
+
+/** One bucket of a rate: how many protocols it holds, and how many of them record a token. */
+export interface BucketRate {
+  bucket: string;
+  n: number;
+  hits: number;
+  rate: number;
+}
+
+/**
+ * How often a protocol's record carries a token, by how long it has run and by what it does. The
+ * base rate is the snapshot's own: 416 of 758 protocols here record a token. A bucket's rate is
+ * shrunk toward the base rate in proportion to its evidence, so a bucket of three protocols barely
+ * moves and a bucket of a hundred moves most of the way.
+ */
+export interface TokenOdds {
+  base: number;
+  hits: number;
+  n: number;
+  prior: number;
+  by_age: BucketRate[];
+  by_category: BucketRate[];
+}
+
+/** How many observations a bucket's rate is worth against the base rate. */
+export const ODDS_PRIOR = 24;
+
+/** Learn the base rate and the two bucket tables from the snapshot's protocols. */
+export function learnTokenOdds(protocols: SnapshotProtocol[], asOf: string): TokenOdds {
+  const base = protocols.length === 0 ? 0 : protocols.filter((p) => recordsToken(p)).length / protocols.length;
+  const ages = new Map<string, { n: number; hits: number }>();
+  const cats = new Map<string, { n: number; hits: number }>();
+  for (const p of protocols) {
+    const hit = recordsToken(p) ? 1 : 0;
+    const a = ages.get(ageBucket(ageDays(asOf, p.listed_at))) ?? { n: 0, hits: 0 };
+    a.n += 1;
+    a.hits += hit;
+    ages.set(ageBucket(ageDays(asOf, p.listed_at)), a);
+    const key = p.category ?? 'Other';
+    const c = cats.get(key) ?? { n: 0, hits: 0 };
+    c.n += 1;
+    c.hits += hit;
+    cats.set(key, c);
   }
-  return { multiple: table.overall_multiple, observations: stat === undefined ? 0 : stat.observations, source: 'universe', category: key };
+  const table = (m: Map<string, { n: number; hits: number }>): BucketRate[] =>
+    [...m.keys()].sort().map((k) => {
+      const v = m.get(k)!;
+      return { bucket: k, n: v.n, hits: v.hits, rate: round4(v.hits / v.n) };
+    });
+  return {
+    base: round4(base),
+    hits: protocols.filter((p) => recordsToken(p)).length,
+    n: protocols.length,
+    prior: ODDS_PRIOR,
+    by_age: table(ages),
+    by_category: table(cats),
+  };
+}
+
+/**
+ * The multiple a protocol is priced at: the size curve's own value at its TVL. The curve replaces the
+ * category table, because a leave-one-out test on this snapshot says it predicts better (see
+ * `leaveOneOut` in dashboard/model.js, which the page runs and shows).
+ */
+export function multipleFor(curve: SizeFit, tvl: number): number {
+  return curveRatio(curve, tvl);
 }
 
 /** Everything one row's implied value is made of, so the page can show the arithmetic. */
@@ -295,34 +334,52 @@ export interface Valuation {
   growth_pct: number;
   growth_multiplier: number;
   multiple: number;
-  multiple_source: 'category' | 'universe';
-  category_observations: number;
+  odds: number;
+  expected: number;
+}
+
+/** How often a protocol in this bucket records a token, shrunk toward the snapshot's base rate. */
+export function oddsFor(odds: TokenOdds, p: SnapshotProtocol, asOf: string): number {
+  const age = odds.by_age.find((b) => b.bucket === ageBucket(ageDays(asOf, p.listed_at)));
+  const cat = odds.by_category.find((b) => b.bucket === (p.category ?? 'Other'));
+  const logit = (x: number) => Math.log(x / (1 - x));
+  const sig = (x: number) => 1 / (1 + Math.exp(-x));
+  const base = odds.base <= 0 || odds.base >= 1 ? 0.5 : odds.base;
+  // Each bucket's own rate, in log-odds, moved toward the base in proportion to its evidence: a
+  // bucket of three protocols barely moves, one of a hundred moves most of the way.
+  const lift = (b: BucketRate | undefined): number => {
+    if (b === undefined || b.n === 0) return 0;
+    const r = (b.hits + 0.5) / (b.n + 1);
+    return (logit(r) - logit(base)) * (b.n / (b.n + odds.prior));
+  };
+  return round4(sig(logit(base) + lift(age) + lift(cat)));
 }
 
 /**
  * Score one protocol. `impliedValueFor` is the only place an implied value is produced, and it takes
- * nothing but the protocol's own record, the learned table and the snapshot's date: the same inputs
- * give the same output for every row.
+ * nothing but the protocol's own record and the fitted curve: the same inputs give the same output
+ * for every row. Growth and age are computed and carried so the page can show them, and they are not
+ * multiplied in: on this snapshot the leave-one-out test says both make the prediction worse.
  */
-export function impliedValueFor(p: SnapshotProtocol, table: LearnTable, asOf: string, params: ModelParams = PARAMS): Valuation {
+export function impliedValueFor(p: SnapshotProtocol, curve: SizeFit, odds: TokenOdds, asOf: string, params: ModelParams = PARAMS): Valuation {
   const age = ageDays(asOf, p.listed_at);
   const rawGrowth = finite(p.change_7d, 0);
   const growthPct = Math.min(params.growth_cap, Math.max(params.growth_floor, rawGrowth));
   const growthMult = round4(1 + (growthPct / 100) * params.growth_weight);
-  const ageForModel = age ?? table.median_age_days;
-  const clamped = Math.min(Math.max(ageForModel, 0), params.age_span_days);
+  const clamped = Math.min(Math.max(age ?? params.age_span_days / 2, 0), params.age_span_days);
   const ageMult = round4(params.age_floor + (clamped / params.age_span_days) * params.age_range);
-  const m = multipleFor(table, p.category);
-  const implied = Math.max(1, Math.round(p.tvl_usd * m.multiple * growthMult * ageMult));
+  const multiple = multipleFor(curve, p.tvl_usd);
+  const implied = Math.max(1, Math.round(p.tvl_usd * multiple));
+  const chance = oddsFor(odds, p, asOf);
   return {
     implied,
     age,
     age_multiplier: ageMult,
     growth_pct: growthPct,
     growth_multiplier: growthMult,
-    multiple: m.multiple,
-    multiple_source: m.source,
-    category_observations: m.observations,
+    multiple,
+    odds: chance,
+    expected: Math.round(implied * chance),
   };
 }
 
@@ -343,10 +400,10 @@ export interface BoardRow {
   on_watchlist: boolean;
   age_days: number | null;
   implied_value_usd: number;
+  odds: number;
+  expected_value_usd: number;
   model: {
-    category_multiple: number;
-    multiple_source: 'category' | 'universe';
-    category_observations: number;
+    multiple: number;
     growth_pct: number;
     growth_multiplier: number;
     age_multiplier: number;
@@ -368,8 +425,8 @@ export interface RadarRow {
   implied_value_usd: number;
   on_watchlist: boolean;
   multiple: number;
-  multiple_source: 'category' | 'universe';
-  category_observations: number;
+  odds: number;
+  expected_value_usd: number;
   growth_multiplier: number;
   age_multiplier: number;
   farm_steps: string[];
@@ -405,7 +462,12 @@ export interface RadarData {
   live_size: number;
   live_with_mcap: number;
   params: ModelParams;
-  learn: LearnTable;
+  /** The size curve fitted on the observations, and the observations themselves: what the page refits. */
+  curve: SizeFit;
+  /** How often a protocol's record carries a token, by age and by category. */
+  odds: TokenOdds;
+  /** Every usable mcap/TVL pair: the page refits the curve from these and runs the LOO test on them. */
+  observations: Observation[];
   rows: RadarRow[];
   live: LiveRow[];
 }
@@ -428,7 +490,7 @@ function bySlug(protocols: SnapshotProtocol[]): Map<string, SnapshotProtocol> {
  * and so is every other protocol the snapshot holds that records no token and is not a product of
  * one that trades: the watchlist is the floor, never the ceiling.
  */
-export function buildBoard(snapshot: Snapshot, table: LearnTable, params: ModelParams = PARAMS): BoardRow[] {
+export function buildBoard(snapshot: Snapshot, curve: SizeFit, odds: TokenOdds, params: ModelParams = PARAMS): BoardRow[] {
   const index = bySlug(snapshot.protocols);
   const watchlist = new Set(snapshot.watchlist);
   const chosen = new Map<string, SnapshotProtocol>();
@@ -453,7 +515,7 @@ export function buildBoard(snapshot: Snapshot, table: LearnTable, params: ModelP
     }
   }
 
-  const scored = [...chosen.values()].map((p) => ({ p, v: impliedValueFor(p, table, snapshot.as_of, params) }));
+  const scored = [...chosen.values()].map((p) => ({ p, v: impliedValueFor(p, curve, odds, snapshot.as_of, params) }));
   scored.sort((a, b) => b.v.implied - a.v.implied || b.p.tvl_usd - a.p.tvl_usd || (a.p.slug < b.p.slug ? -1 : a.p.slug > b.p.slug ? 1 : 0));
   return scored.slice(0, MAX_BOARD_ROWS).map((s, i) => ({
     rank: i + 1,
@@ -471,10 +533,10 @@ export function buildBoard(snapshot: Snapshot, table: LearnTable, params: ModelP
     on_watchlist: watchlist.has(s.p.slug),
     age_days: s.v.age,
     implied_value_usd: s.v.implied,
+    odds: s.v.odds,
+    expected_value_usd: s.v.expected,
     model: {
-      category_multiple: s.v.multiple,
-      multiple_source: s.v.multiple_source,
-      category_observations: s.v.category_observations,
+      multiple: s.v.multiple,
       growth_pct: s.v.growth_pct,
       growth_multiplier: s.v.growth_multiplier,
       age_multiplier: s.v.age_multiplier,
@@ -486,9 +548,9 @@ export function buildBoard(snapshot: Snapshot, table: LearnTable, params: ModelP
 /**
  * The protocols whose token already trades, largest market cap first. These are set aside from the
  * ranking and shown with the market's own figures — and their mcap/TVL ratios are the observations
- * `learnCategoryMultiples` prices every pre-token protocol from.
+ * the size curve is fitted on.
  */
-export function liveRows(snapshot: Snapshot, table: LearnTable): LiveRow[] {
+export function liveRows(snapshot: Snapshot): LiveRow[] {
   return snapshot.protocols
     .filter((p) => recordsToken(p))
     .map((p) => {
@@ -504,7 +566,7 @@ export function liveRows(snapshot: Snapshot, table: LearnTable): LiveRow[] {
         symbol: p.symbol,
         listed_at: p.listed_at,
         ratio,
-        counted: ratio !== null && ratio > 0 && ratio < table.ratio_ceiling,
+        counted: ratio !== null && ratio > 0 && ratio < RATIO_CEILING,
       };
     })
     .sort((a, b) => (b.mcap_usd ?? -1) - (a.mcap_usd ?? -1) || b.tvl_usd - a.tvl_usd || (a.slug < b.slug ? -1 : 1));
@@ -524,20 +586,42 @@ export function radarRow(row: BoardRow): RadarRow {
     age_days: row.age_days,
     implied_value_usd: row.implied_value_usd,
     on_watchlist: row.on_watchlist,
-    multiple: row.model.category_multiple,
-    multiple_source: row.model.multiple_source,
-    category_observations: row.model.category_observations,
+    multiple: row.model.multiple,
+    odds: row.odds,
+    expected_value_usd: row.expected_value_usd,
     growth_multiplier: row.model.growth_multiplier,
     age_multiplier: row.model.age_multiplier,
     farm_steps: row.farm_steps,
   };
 }
 
+/** The observations the curve is fitted on: every protocol that trades with a usable ratio. */
+export function observationsOf(protocols: SnapshotProtocol[], asOf: string): Observation[] {
+  const out: Observation[] = [];
+  for (const p of protocols) {
+    if (p.mcap_usd === null || p.mcap_usd <= 0) continue;
+    if (!Number.isFinite(p.tvl_usd) || p.tvl_usd <= 0) continue;
+    const ratio = round6(p.mcap_usd / p.tvl_usd);
+    if (ratio <= 0 || ratio >= RATIO_CEILING) continue;
+    out.push({
+      tvl: p.tvl_usd,
+      ratio,
+      category: p.category ?? 'Other',
+      age_days: ageDays(asOf, p.listed_at),
+      change_7d: p.change_7d,
+    });
+  }
+  return out;
+}
+
 /** Everything the dashboard renders, from the snapshot. */
 export function buildRadar(snapshot: Snapshot): { board: BoardRow[]; radar: RadarData } {
-  const table = learnCategoryMultiples(snapshot.protocols, snapshot.as_of);
-  const board = buildBoard(snapshot, table);
-  const live = liveRows(snapshot, table);
+  const observations = observationsOf(snapshot.protocols, snapshot.as_of);
+  const curve = fitCurve(observations);
+  if (curve === null) throw new SnapshotError('the snapshot carries too few usable ratios to fit a curve');
+  const odds = learnTokenOdds(snapshot.protocols, snapshot.as_of);
+  const board = buildBoard(snapshot, curve, odds);
+  const live = liveRows(snapshot);
   const watchlist = new Set(snapshot.watchlist);
   const onWatchlist = board.filter((r) => watchlist.has(r.slug)).length;
   const radar: RadarData = {
@@ -553,7 +637,9 @@ export function buildRadar(snapshot: Snapshot): { board: BoardRow[]; radar: Rada
     live_size: live.length,
     live_with_mcap: live.filter((r) => r.mcap_usd !== null).length,
     params: PARAMS,
-    learn: table,
+    curve,
+    odds,
+    observations,
     rows: board.map(radarRow),
     live,
   };

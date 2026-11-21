@@ -87,6 +87,24 @@ export function gasFor(chain: string): GasTier {
   return GAS[chain] ?? DEFAULT_GAS;
 }
 
+/** The midpoint of a gas string like "$2 to $12" or "under $0.05", in dollars. */
+function midpoint(text: string): number {
+  const nums = text.match(/\d+(?:\.\d+)?/g);
+  if (nums === null || nums.length === 0) return 0;
+  const values = nums.map(Number);
+  return values.length === 1 ? values[0]! : (values[0]! + values[values.length - 1]!) / 2;
+}
+
+/**
+ * What one farm position costs in gas, all in: the deposit and its approval, a month of weekly
+ * checks, and the withdrawal. Derived from the same tier table the step text quotes, so the figure
+ * and the prose cannot drift apart. An estimate, and the step that uses it says so.
+ */
+export function gasUsdFor(chain: string): number {
+  const tier = gasFor(chain);
+  return Math.round(3 * midpoint(tier.tx) + midpoint(tier.week));
+}
+
 /** How much one position needs: a slice of the protocol's own TVL, in round dollars. */
 export function capitalFor(tvlUsd: number): number {
   if (tvlUsd >= 5_000_000_000) return 300;
@@ -172,6 +190,31 @@ function depthStep(p: SnapshotProtocol, capital: number): FarmStep {
 }
 
 /**
+ * The last step, and the only one that puts a number on the trade: the position the plan describes,
+ * priced at the odds this protocol's record turns into a token, less the gas the plan spends. Every
+ * term is derived — the size from the TVL, the odds from the snapshot's own base rates, the gas from
+ * the chain's tier — and the whole thing is labelled an estimate, because it is one.
+ */
+function netStep(p: SnapshotProtocol, ctx: Ctx): FarmStep {
+  const odds = ctx.valuation.odds;
+  const position = ctx.capital;
+  const gas = gasUsdFor(primaryChain(p));
+  const gross = Math.round(position * odds);
+  const net = gross - gas;
+  // The size at which the expected value just clears the gas: the reader can compare it with what
+  // they actually have, which is the decision the earlier steps do not make for them.
+  const breakEven = ctx.hold === 0 ? 0 : Math.round(gas / Math.max(odds, 0.01));
+  const verdict = net >= 0
+    ? `that clears the gas by $${net}`
+    : `the gas costs $${-net} more than the position's expected value, so at this size the farm does not pay`;
+  return {
+    text: `Price the whole farm before you start. A $${position} position at this protocol's ${(odds * 100).toFixed(1)}% chance of a token is $${gross} of expected value, and about $${gas} of gas to open, watch for a month and close: ${verdict}. Break-even needs a position of about $${breakEven}. Every figure here is an estimate from this protocol's own bucket rates and its chain's fee tier, not a quote.`,
+    cost: `$${gas} of gas across the open, the weekly checks and the close, subtracted above`,
+    time: '10 minutes to size it, before any money moves',
+  };
+}
+
+/**
  * A plan for a risk curator: the farmable side is the vaults the curator runs, and the application
  * where it takes one. A curator's own token, if it ever issues one, prices the book it manages.
  */
@@ -214,6 +257,7 @@ function curatorPlan(p: SnapshotProtocol, ctx: Ctx): FarmStep[] {
     },
     depthStep(p, ctx.capital),
     logStep(ctx.capital, ctx.hold),
+    netStep(p, ctx),
   ];
 }
 
@@ -245,6 +289,7 @@ function allocatorPlan(p: SnapshotProtocol, ctx: Ctx): FarmStep[] {
     },
     depthStep(p, ctx.capital),
     logStep(ctx.capital, ctx.hold),
+    netStep(p, ctx),
   ];
 }
 
@@ -289,6 +334,7 @@ function lendingPlan(p: SnapshotProtocol, ctx: Ctx): FarmStep[] {
     },
     depthStep(p, ctx.capital),
     logStep(ctx.capital, ctx.hold),
+    netStep(p, ctx),
   ];
 }
 
@@ -320,6 +366,7 @@ function liquidityPlan(p: SnapshotProtocol, ctx: Ctx): FarmStep[] {
     },
     depthStep(p, ctx.capital),
     logStep(ctx.capital, ctx.hold),
+    netStep(p, ctx),
   ];
 }
 
@@ -351,6 +398,7 @@ function rwaPlan(p: SnapshotProtocol, ctx: Ctx): FarmStep[] {
     },
     depthStep(p, ctx.capital),
     logStep(ctx.capital, ctx.hold),
+    netStep(p, ctx),
   ];
 }
 
@@ -382,6 +430,7 @@ function basisPlan(p: SnapshotProtocol, ctx: Ctx): FarmStep[] {
     },
     depthStep(p, ctx.capital),
     logStep(ctx.capital, ctx.hold),
+    netStep(p, ctx),
   ];
 }
 
@@ -413,6 +462,7 @@ function derivativesPlan(p: SnapshotProtocol, ctx: Ctx): FarmStep[] {
     },
     depthStep(p, ctx.capital),
     logStep(ctx.capital, ctx.hold),
+    netStep(p, ctx),
   ];
 }
 
@@ -444,6 +494,7 @@ function chainPlan(p: SnapshotProtocol, ctx: Ctx): FarmStep[] {
     },
     depthStep(p, ctx.capital),
     logStep(ctx.capital, ctx.hold),
+    netStep(p, ctx),
   ];
 }
 
@@ -471,6 +522,7 @@ function genericPlan(p: SnapshotProtocol, ctx: Ctx): FarmStep[] {
     },
     depthStep(p, ctx.capital),
     logStep(ctx.capital, ctx.hold),
+    netStep(p, ctx),
   ];
 }
 
@@ -479,6 +531,8 @@ interface Ctx {
   gas: GasTier;
   capital: number;
   hold: number;
+  /** The scored row: the plan prices its last step from the same valuation the board ranks on. */
+  valuation: Valuation;
 }
 
 /**
@@ -491,6 +545,7 @@ export function farmPlanFor(p: SnapshotProtocol, valuation: Valuation): string[]
     gas: gasFor(primaryChain(p)),
     capital: capitalFor(p.tvl_usd),
     hold: holdDaysFor(valuation.age),
+    valuation,
   };
   const key = keyOf(p);
   let steps: FarmStep[];
